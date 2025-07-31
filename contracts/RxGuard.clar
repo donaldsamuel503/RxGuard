@@ -6,9 +6,15 @@
 (define-constant ERR-INVALID-DOCTOR (err u105))
 (define-constant ERR-INVALID-AUDIT-ACCESS (err u106))
 (define-constant ERR-INVALID-AUDIT-ID (err u107))
+(define-constant ERR-INVALID-TRANSFER (err u108))
+(define-constant ERR-TRANSFER-NOT-PENDING (err u109))
+(define-constant ERR-TRANSFER-ALREADY-EXISTS (err u110))
+(define-constant ERR-SAME-PHARMACY (err u111))
+(define-constant ERR-PRESCRIPTION-FILLED (err u112))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var audit-counter uint u0)
+(define-data-var transfer-counter uint u0)
 
 (define-map authorized-doctors
     principal
@@ -65,6 +71,31 @@
         prescription-fills: uint,
         verification-requests: uint,
         compliance-violations: uint,
+    }
+)
+
+(define-map prescription-transfers
+    { transfer-id: uint }
+    {
+        prescription-id: uint,
+        source-pharmacy: principal,
+        destination-pharmacy: principal,
+        requester: principal,
+        transfer-fee: uint,
+        request-timestamp: uint,
+        source-approval: bool,
+        destination-approval: bool,
+        transfer-status: (string-ascii 16),
+        completion-timestamp: (optional uint),
+        transfer-reason: (string-utf8 128),
+    }
+)
+
+(define-map prescription-transfer-lookup
+    { prescription-id: uint }
+    {
+        active-transfer-id: (optional uint),
+        transfer-count: uint,
     }
 )
 
@@ -425,4 +456,211 @@
             current-audit-counter: (var-get audit-counter),
         })
     )
+)
+
+(define-public (request-prescription-transfer
+        (prescription-id uint)
+        (destination-pharmacy principal)
+        (transfer-reason (string-utf8 128))
+        (transfer-fee uint)
+    )
+    (let (
+            (prescription (unwrap!
+                (map-get? prescriptions { prescription-id: prescription-id })
+                ERR-INVALID-PRESCRIPTION
+            ))
+            (current-lookup (default-to
+                { active-transfer-id: none, transfer-count: u0 }
+                (map-get? prescription-transfer-lookup { prescription-id: prescription-id })
+            ))
+            (current-counter (var-get transfer-counter))
+            (new-transfer-id (+ current-counter u1))
+        )
+        (begin
+            (asserts! (not (get filled prescription)) ERR-PRESCRIPTION-FILLED)
+            (asserts! (is-authorized-pharmacy destination-pharmacy) ERR-INVALID-PHARMACY)
+            (asserts! (is-none (get active-transfer-id current-lookup)) ERR-TRANSFER-ALREADY-EXISTS)
+            (var-set transfer-counter new-transfer-id)
+            (map-set prescription-transfers { transfer-id: new-transfer-id } {
+                prescription-id: prescription-id,
+                source-pharmacy: (get doctor prescription),
+                destination-pharmacy: destination-pharmacy,
+                requester: tx-sender,
+                transfer-fee: transfer-fee,
+                request-timestamp: stacks-block-height,
+                source-approval: false,
+                destination-approval: false,
+                transfer-status: "PENDING",
+                completion-timestamp: none,
+                transfer-reason: transfer-reason,
+            })
+            (map-set prescription-transfer-lookup { prescription-id: prescription-id } {
+                active-transfer-id: (some new-transfer-id),
+                transfer-count: (+ (get transfer-count current-lookup) u1),
+            })
+            (let ((audit-details (concat u"Transfer requested for new pharmacy, Reason: " transfer-reason)))
+                (log-audit-event prescription-id "TRANSFER_REQUESTED" audit-details)
+            )
+            (ok new-transfer-id)
+        )
+    )
+)
+
+(define-public (approve-transfer-source (transfer-id uint))
+    (let (
+            (transfer (unwrap!
+                (map-get? prescription-transfers { transfer-id: transfer-id })
+                ERR-INVALID-TRANSFER
+            ))
+        )
+        (begin
+            (asserts!
+                (is-eq tx-sender (get source-pharmacy transfer))
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts!
+                (is-eq (get transfer-status transfer) "PENDING")
+                ERR-TRANSFER-NOT-PENDING
+            )
+            (map-set prescription-transfers { transfer-id: transfer-id }
+                (merge transfer { source-approval: true })
+            )
+            (let ((audit-details u"Source pharmacy approved transfer request"))
+                (log-audit-event (get prescription-id transfer) "TRANSFER_SOURCE_APPROVED" audit-details)
+            )
+            (try! (check-and-complete-transfer transfer-id))
+            (ok true)
+        )
+    )
+)
+
+(define-public (approve-transfer-destination (transfer-id uint))
+    (let (
+            (transfer (unwrap!
+                (map-get? prescription-transfers { transfer-id: transfer-id })
+                ERR-INVALID-TRANSFER
+            ))
+        )
+        (begin
+            (asserts!
+                (is-eq tx-sender (get destination-pharmacy transfer))
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts!
+                (is-eq (get transfer-status transfer) "PENDING")
+                ERR-TRANSFER-NOT-PENDING
+            )
+            (map-set prescription-transfers { transfer-id: transfer-id }
+                (merge transfer { destination-approval: true })
+            )
+            (let ((audit-details u"Destination pharmacy approved transfer request"))
+                (log-audit-event (get prescription-id transfer) "TRANSFER_DEST_APPROVED" audit-details)
+            )
+            (try! (check-and-complete-transfer transfer-id))
+            (ok true)
+        )
+    )
+)
+
+(define-private (check-and-complete-transfer (transfer-id uint))
+    (let (
+            (transfer (unwrap!
+                (map-get? prescription-transfers { transfer-id: transfer-id })
+                ERR-INVALID-TRANSFER
+            ))
+        )
+        (if (and (get source-approval transfer) (get destination-approval transfer))
+            (complete-prescription-transfer transfer-id)
+            (ok false)
+        )
+    )
+)
+
+(define-private (complete-prescription-transfer (transfer-id uint))
+    (let (
+            (transfer (unwrap!
+                (map-get? prescription-transfers { transfer-id: transfer-id })
+                ERR-INVALID-TRANSFER
+            ))
+            (prescription (unwrap!
+                (map-get? prescriptions { prescription-id: (get prescription-id transfer) })
+                ERR-INVALID-PRESCRIPTION
+            ))
+        )
+        (begin
+            (map-set prescription-transfers { transfer-id: transfer-id }
+                (merge transfer {
+                    transfer-status: "COMPLETED",
+                    completion-timestamp: (some stacks-block-height),
+                })
+            )
+            (map-set prescriptions { prescription-id: (get prescription-id transfer) }
+                (merge prescription {
+                    filled: true,
+                    filling-pharmacy: (some (get destination-pharmacy transfer)),
+                })
+            )
+            (map-set prescription-transfer-lookup { prescription-id: (get prescription-id transfer) } {
+                active-transfer-id: none,
+                transfer-count: (get transfer-count (unwrap!
+                    (map-get? prescription-transfer-lookup { prescription-id: (get prescription-id transfer) })
+                    ERR-INVALID-PRESCRIPTION
+                )),
+            })
+            (let ((audit-details u"Prescription transfer completed successfully"))
+                (log-audit-event (get prescription-id transfer) "TRANSFER_COMPLETED" audit-details)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (reject-transfer (transfer-id uint))
+    (let (
+            (transfer (unwrap!
+                (map-get? prescription-transfers { transfer-id: transfer-id })
+                ERR-INVALID-TRANSFER
+            ))
+        )
+        (begin
+            (asserts!
+                (or
+                    (is-eq tx-sender (get source-pharmacy transfer))
+                    (is-eq tx-sender (get destination-pharmacy transfer))
+                    (is-eq tx-sender (var-get contract-owner))
+                )
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts!
+                (is-eq (get transfer-status transfer) "PENDING")
+                ERR-TRANSFER-NOT-PENDING
+            )
+            (map-set prescription-transfers { transfer-id: transfer-id }
+                (merge transfer { transfer-status: "REJECTED" })
+            )
+            (map-set prescription-transfer-lookup { prescription-id: (get prescription-id transfer) } {
+                active-transfer-id: none,
+                transfer-count: (get transfer-count (unwrap!
+                    (map-get? prescription-transfer-lookup { prescription-id: (get prescription-id transfer) })
+                    ERR-INVALID-PRESCRIPTION
+                )),
+            })
+            (let ((audit-details u"Transfer request rejected"))
+                (log-audit-event (get prescription-id transfer) "TRANSFER_REJECTED" audit-details)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-prescription-transfer (transfer-id uint))
+    (map-get? prescription-transfers { transfer-id: transfer-id })
+)
+
+(define-read-only (get-prescription-transfer-status (prescription-id uint))
+    (map-get? prescription-transfer-lookup { prescription-id: prescription-id })
+)
+
+(define-read-only (get-transfer-counter)
+    (var-get transfer-counter)
 )
