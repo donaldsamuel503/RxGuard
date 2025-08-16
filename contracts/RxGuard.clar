@@ -11,10 +11,16 @@
 (define-constant ERR-TRANSFER-ALREADY-EXISTS (err u110))
 (define-constant ERR-SAME-PHARMACY (err u111))
 (define-constant ERR-PRESCRIPTION-FILLED (err u112))
+(define-constant ERR-NO-REFILLS-REMAINING (err u113))
+(define-constant ERR-REFILL-TOO-EARLY (err u114))
+(define-constant ERR-INVALID-REFILL-CONFIG (err u115))
+(define-constant ERR-REFILL-NOT-FOUND (err u116))
+(define-constant ERR-REFILL-ALREADY-PROCESSED (err u117))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var audit-counter uint u0)
 (define-data-var transfer-counter uint u0)
+(define-data-var refill-counter uint u0)
 
 (define-map authorized-doctors
     principal
@@ -96,6 +102,48 @@
     {
         active-transfer-id: (optional uint),
         transfer-count: uint,
+    }
+)
+
+(define-map prescription-refill-config
+    { prescription-id: uint }
+    {
+        max-refills: uint,
+        refills-used: uint,
+        days-between-refills: uint,
+        early-refill-threshold: uint,
+        last-refill-timestamp: (optional uint),
+        next-eligible-refill: (optional uint),
+        requires-doctor-approval: bool,
+    }
+)
+
+(define-map refill-requests
+    { refill-id: uint }
+    {
+        prescription-id: uint,
+        requesting-pharmacy: principal,
+        request-timestamp: uint,
+        is-early-refill: bool,
+        early-refill-reason: (optional (string-utf8 128)),
+        doctor-approval: bool,
+        pharmacy-approval: bool,
+        refill-status: (string-ascii 16),
+        processed-timestamp: (optional uint),
+        dispensed-quantity: (optional uint),
+    }
+)
+
+(define-map refill-history
+    { prescription-id: uint, refill-sequence: uint }
+    {
+        refill-id: uint,
+        dispensing-pharmacy: principal,
+        dispense-timestamp: uint,
+        quantity-dispensed: uint,
+        days-early: uint,
+        approval-required: bool,
+        insurance-claim: (optional (string-utf8 64)),
     }
 )
 
@@ -664,3 +712,313 @@
 (define-read-only (get-transfer-counter)
     (var-get transfer-counter)
 )
+
+;; Refill Management System
+(define-public (configure-prescription-refills
+        (prescription-id uint)
+        (max-refills uint)
+        (days-between-refills uint)
+        (early-refill-threshold uint)
+        (requires-doctor-approval bool)
+    )
+    (let (
+            (prescription (unwrap!
+                (map-get? prescriptions { prescription-id: prescription-id })
+                ERR-INVALID-PRESCRIPTION
+            ))
+        )
+        (begin
+            (asserts!
+                (is-eq tx-sender (get doctor prescription))
+                ERR-NOT-AUTHORIZED
+            )
+            (map-set prescription-refill-config { prescription-id: prescription-id } {
+                max-refills: max-refills,
+                refills-used: u0,
+                days-between-refills: days-between-refills,
+                early-refill-threshold: early-refill-threshold,
+                last-refill-timestamp: none,
+                next-eligible-refill: none,
+                requires-doctor-approval: requires-doctor-approval,
+            })
+            (let ((audit-details u"Refill configuration set for prescription"))
+                (log-audit-event prescription-id "REFILL_CONFIG_SET" audit-details)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (request-refill
+        (prescription-id uint)
+        (requesting-pharmacy principal)
+        (requested-quantity uint)
+        (early-refill-reason (optional (string-utf8 128)))
+    )
+    (let (
+            (prescription (unwrap!
+                (map-get? prescriptions { prescription-id: prescription-id })
+                ERR-INVALID-PRESCRIPTION
+            ))
+            (refill-config (unwrap!
+                (map-get? prescription-refill-config { prescription-id: prescription-id })
+                ERR-INVALID-REFILL-CONFIG
+            ))
+            (current-counter (var-get refill-counter))
+            (new-refill-id (+ current-counter u1))
+            (is-early (check-early-refill refill-config))
+        )
+        (begin
+            (asserts! (is-authorized-pharmacy requesting-pharmacy) ERR-INVALID-PHARMACY)
+            (asserts!
+                (< (get refills-used refill-config) (get max-refills refill-config))
+                ERR-NO-REFILLS-REMAINING
+            )
+            (if (and is-early (not (get requires-doctor-approval refill-config)))
+                (asserts! false ERR-REFILL-TOO-EARLY)
+                true
+            )
+            (var-set refill-counter new-refill-id)
+            (map-set refill-requests { refill-id: new-refill-id } {
+                prescription-id: prescription-id,
+                requesting-pharmacy: requesting-pharmacy,
+                request-timestamp: stacks-block-height,
+                is-early-refill: is-early,
+                early-refill-reason: early-refill-reason,
+                doctor-approval: (not (get requires-doctor-approval refill-config)),
+                pharmacy-approval: false,
+                refill-status: "PENDING",
+                processed-timestamp: none,
+                dispensed-quantity: (some requested-quantity),
+            })
+            (let ((audit-details (if is-early
+                    u"Early refill requested with medical justification"
+                    u"Regular refill requested within normal timeframe"
+                )))
+                (log-audit-event prescription-id "REFILL_REQUESTED" audit-details)
+            )
+            (ok new-refill-id)
+        )
+    )
+)
+
+(define-private (check-early-refill (refill-config (tuple (max-refills uint) (refills-used uint) (days-between-refills uint) (early-refill-threshold uint) (last-refill-timestamp (optional uint)) (next-eligible-refill (optional uint)) (requires-doctor-approval bool))))
+    (match (get last-refill-timestamp refill-config)
+        last-refill
+            (let ((days-since-last (- stacks-block-height last-refill)))
+                (< days-since-last (- (get days-between-refills refill-config) (get early-refill-threshold refill-config)))
+            )
+        false
+    )
+)
+
+(define-public (approve-refill-doctor (refill-id uint))
+    (let (
+            (refill-request (unwrap!
+                (map-get? refill-requests { refill-id: refill-id })
+                ERR-REFILL-NOT-FOUND
+            ))
+            (prescription (unwrap!
+                (map-get? prescriptions { prescription-id: (get prescription-id refill-request) })
+                ERR-INVALID-PRESCRIPTION
+            ))
+        )
+        (begin
+            (asserts!
+                (is-eq tx-sender (get doctor prescription))
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts!
+                (is-eq (get refill-status refill-request) "PENDING")
+                ERR-REFILL-ALREADY-PROCESSED
+            )
+            (map-set refill-requests { refill-id: refill-id }
+                (merge refill-request { doctor-approval: true })
+            )
+            (let ((audit-details u"Doctor approved refill request"))
+                (log-audit-event (get prescription-id refill-request) "REFILL_DOCTOR_APPROVED" audit-details)
+            )
+            (try! (check-and-process-refill refill-id))
+            (ok true)
+        )
+    )
+)
+
+(define-public (approve-refill-pharmacy (refill-id uint))
+    (let (
+            (refill-request (unwrap!
+                (map-get? refill-requests { refill-id: refill-id })
+                ERR-REFILL-NOT-FOUND
+            ))
+        )
+        (begin
+            (asserts!
+                (is-eq tx-sender (get requesting-pharmacy refill-request))
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts!
+                (is-eq (get refill-status refill-request) "PENDING")
+                ERR-REFILL-ALREADY-PROCESSED
+            )
+            (map-set refill-requests { refill-id: refill-id }
+                (merge refill-request { pharmacy-approval: true })
+            )
+            (let ((audit-details u"Pharmacy confirmed refill dispensing"))
+                (log-audit-event (get prescription-id refill-request) "REFILL_PHARMACY_APPROVED" audit-details)
+            )
+            (try! (check-and-process-refill refill-id))
+            (ok true)
+        )
+    )
+)
+
+(define-private (check-and-process-refill (refill-id uint))
+    (let (
+            (refill-request (unwrap!
+                (map-get? refill-requests { refill-id: refill-id })
+                ERR-REFILL-NOT-FOUND
+            ))
+        )
+        (if (and (get doctor-approval refill-request) (get pharmacy-approval refill-request))
+            (process-refill-completion refill-id)
+            (ok false)
+        )
+    )
+)
+
+(define-private (process-refill-completion (refill-id uint))
+    (let (
+            (refill-request (unwrap!
+                (map-get? refill-requests { refill-id: refill-id })
+                ERR-REFILL-NOT-FOUND
+            ))
+            (refill-config (unwrap!
+                (map-get? prescription-refill-config { prescription-id: (get prescription-id refill-request) })
+                ERR-INVALID-REFILL-CONFIG
+            ))
+            (new-refills-used (+ (get refills-used refill-config) u1))
+            (next-eligible (+ stacks-block-height (get days-between-refills refill-config)))
+        )
+        (begin
+            (map-set refill-requests { refill-id: refill-id }
+                (merge refill-request {
+                    refill-status: "COMPLETED",
+                    processed-timestamp: (some stacks-block-height),
+                })
+            )
+            (map-set prescription-refill-config { prescription-id: (get prescription-id refill-request) }
+                (merge refill-config {
+                    refills-used: new-refills-used,
+                    last-refill-timestamp: (some stacks-block-height),
+                    next-eligible-refill: (some next-eligible),
+                })
+            )
+            (map-set refill-history 
+                { prescription-id: (get prescription-id refill-request), refill-sequence: new-refills-used } {
+                refill-id: refill-id,
+                dispensing-pharmacy: (get requesting-pharmacy refill-request),
+                dispense-timestamp: stacks-block-height,
+                quantity-dispensed: (unwrap! (get dispensed-quantity refill-request) ERR-INVALID-REFILL-CONFIG),
+                days-early: (if (get is-early-refill refill-request)
+                    (calculate-days-early refill-config)
+                    u0
+                ),
+                approval-required: (get requires-doctor-approval refill-config),
+                insurance-claim: none,
+            })
+            (let ((audit-details u"Refill processed and dispensed successfully"))
+                (log-audit-event (get prescription-id refill-request) "REFILL_COMPLETED" audit-details)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-private (calculate-days-early (refill-config (tuple (max-refills uint) (refills-used uint) (days-between-refills uint) (early-refill-threshold uint) (last-refill-timestamp (optional uint)) (next-eligible-refill (optional uint)) (requires-doctor-approval bool))))
+    (match (get last-refill-timestamp refill-config)
+        last-refill
+            (let ((days-since-last (- stacks-block-height last-refill))
+                  (expected-days (get days-between-refills refill-config)))
+                (if (< days-since-last expected-days)
+                    (- expected-days days-since-last)
+                    u0
+                )
+            )
+        u0
+    )
+)
+
+(define-public (reject-refill (refill-id uint) (rejection-reason (string-utf8 128)))
+    (let (
+            (refill-request (unwrap!
+                (map-get? refill-requests { refill-id: refill-id })
+                ERR-REFILL-NOT-FOUND
+            ))
+            (prescription (unwrap!
+                (map-get? prescriptions { prescription-id: (get prescription-id refill-request) })
+                ERR-INVALID-PRESCRIPTION
+            ))
+        )
+        (begin
+            (asserts!
+                (or
+                    (is-eq tx-sender (get doctor prescription))
+                    (is-eq tx-sender (get requesting-pharmacy refill-request))
+                    (is-eq tx-sender (var-get contract-owner))
+                )
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts!
+                (is-eq (get refill-status refill-request) "PENDING")
+                ERR-REFILL-ALREADY-PROCESSED
+            )
+            (map-set refill-requests { refill-id: refill-id }
+                (merge refill-request { refill-status: "REJECTED" })
+            )
+            (let ((audit-details (concat u"Refill rejected: " rejection-reason)))
+                (log-audit-event (get prescription-id refill-request) "REFILL_REJECTED" audit-details)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-refill-eligibility (prescription-id uint))
+    (match (map-get? prescription-refill-config { prescription-id: prescription-id })
+        refill-config
+            (let (
+                    (refills-remaining (- (get max-refills refill-config) (get refills-used refill-config)))
+                    (is-eligible (> refills-remaining u0))
+                    (next-eligible-date (get next-eligible-refill refill-config))
+                    (can-refill-now (match next-eligible-date
+                        date (>= stacks-block-height date)
+                        true
+                    ))
+                )
+                (ok {
+                    eligible: is-eligible,
+                    refills-remaining: refills-remaining,
+                    can-refill-now: can-refill-now,
+                    next-eligible-date: next-eligible-date,
+                })
+            )
+        ERR-INVALID-REFILL-CONFIG
+    )
+)
+
+(define-read-only (get-refill-request (refill-id uint))
+    (map-get? refill-requests { refill-id: refill-id })
+)
+
+(define-read-only (get-refill-config (prescription-id uint))
+    (map-get? prescription-refill-config { prescription-id: prescription-id })
+)
+
+(define-read-only (get-refill-history (prescription-id uint) (refill-sequence uint))
+    (map-get? refill-history { prescription-id: prescription-id, refill-sequence: refill-sequence })
+)
+
+(define-read-only (get-refill-counter)
+    (var-get refill-counter)
+)
+
