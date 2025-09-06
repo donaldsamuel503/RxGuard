@@ -16,11 +16,17 @@
 (define-constant ERR-INVALID-REFILL-CONFIG (err u115))
 (define-constant ERR-REFILL-NOT-FOUND (err u116))
 (define-constant ERR-REFILL-ALREADY-PROCESSED (err u117))
+(define-constant ERR-NOT-EMERGENCY-RESPONDER (err u118))
+(define-constant ERR-INVALID-EMERGENCY-OVERRIDE (err u119))
+(define-constant ERR-OVERRIDE-EXPIRED (err u120))
+(define-constant ERR-OVERRIDE-ALREADY-EXISTS (err u121))
+(define-constant ERR-INSUFFICIENT-JUSTIFICATION (err u122))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var audit-counter uint u0)
 (define-data-var transfer-counter uint u0)
 (define-data-var refill-counter uint u0)
+(define-data-var emergency-override-counter uint u0)
 
 (define-map authorized-doctors
     principal
@@ -1020,5 +1026,272 @@
 
 (define-read-only (get-refill-counter)
     (var-get refill-counter)
+)
+
+;; Emergency Override System
+(define-map authorized-emergency-responders
+    principal
+    {
+        facility-name: (string-utf8 64),
+        facility-type: (string-ascii 32),
+        authorized-by: principal,
+        authorization-timestamp: uint,
+        is-active: bool,
+    }
+)
+
+(define-map emergency-overrides
+    { override-id: uint }
+    {
+        prescription-id: uint,
+        requesting-responder: principal,
+        emergency-justification: (string-utf8 256),
+        patient-emergency-id: (string-utf8 64),
+        override-expiry: uint,
+        supervisor-approval: bool,
+        supervising-responder: (optional principal),
+        override-status: (string-ascii 16),
+        creation-timestamp: uint,
+        approval-timestamp: (optional uint),
+        dispensing-pharmacy: (optional principal),
+        emergency-quantity: uint,
+    }
+)
+
+(define-public (add-emergency-responder
+        (responder principal)
+        (facility-name (string-utf8 64))
+        (facility-type (string-ascii 32))
+    )
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> (len facility-name) u0) ERR-INSUFFICIENT-JUSTIFICATION)
+        (map-set authorized-emergency-responders responder {
+            facility-name: facility-name,
+            facility-type: facility-type,
+            authorized-by: tx-sender,
+            authorization-timestamp: stacks-block-height,
+            is-active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (deactivate-emergency-responder (responder principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (let (
+                (responder-info (unwrap!
+                    (map-get? authorized-emergency-responders responder)
+                    ERR-NOT-EMERGENCY-RESPONDER
+                ))
+            )
+            (begin
+                (map-set authorized-emergency-responders responder
+                    (merge responder-info { is-active: false })
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-read-only (is-emergency-responder (responder principal))
+    (match (map-get? authorized-emergency-responders responder)
+        responder-info (get is-active responder-info)
+        false
+    )
+)
+
+(define-public (request-emergency-override
+        (prescription-id uint)
+        (emergency-justification (string-utf8 256))
+        (patient-emergency-id (string-utf8 64))
+        (emergency-quantity uint)
+        (override-duration-blocks uint)
+    )
+    (let (
+            (prescription (unwrap!
+                (map-get? prescriptions { prescription-id: prescription-id })
+                ERR-INVALID-PRESCRIPTION
+            ))
+            (current-counter (var-get emergency-override-counter))
+            (new-override-id (+ current-counter u1))
+            (override-expiry (+ stacks-block-height override-duration-blocks))
+        )
+        (begin
+            (asserts! (is-emergency-responder tx-sender) ERR-NOT-EMERGENCY-RESPONDER)
+            (asserts! (> (len emergency-justification) u20) ERR-INSUFFICIENT-JUSTIFICATION)
+            (asserts! (> emergency-quantity u0) ERR-INVALID-EMERGENCY-OVERRIDE)
+            (asserts! (<= override-duration-blocks u4320) ERR-INVALID-EMERGENCY-OVERRIDE) ;; Max 72 hours
+            (var-set emergency-override-counter new-override-id)
+            (map-set emergency-overrides { override-id: new-override-id } {
+                prescription-id: prescription-id,
+                requesting-responder: tx-sender,
+                emergency-justification: emergency-justification,
+                patient-emergency-id: patient-emergency-id,
+                override-expiry: override-expiry,
+                supervisor-approval: false,
+                supervising-responder: none,
+                override-status: "PENDING",
+                creation-timestamp: stacks-block-height,
+                approval-timestamp: none,
+                dispensing-pharmacy: none,
+                emergency-quantity: emergency-quantity,
+            })
+            (let ((audit-details u"Emergency override requested for critical patient care"))
+                (log-audit-event prescription-id "EMERGENCY_OVERRIDE_REQUESTED" audit-details)
+            )
+            (ok new-override-id)
+        )
+    )
+)
+
+(define-public (approve-emergency-override
+        (override-id uint)
+        (supervising-responder (optional principal))
+    )
+    (let (
+            (override-request (unwrap!
+                (map-get? emergency-overrides { override-id: override-id })
+                ERR-INVALID-EMERGENCY-OVERRIDE
+            ))
+        )
+        (begin
+            (asserts!
+                (or
+                    (is-eq tx-sender (var-get contract-owner))
+                    (is-emergency-responder tx-sender)
+                )
+                ERR-NOT-EMERGENCY-RESPONDER
+            )
+            (asserts!
+                (is-eq (get override-status override-request) "PENDING")
+                ERR-OVERRIDE-ALREADY-EXISTS
+            )
+            (asserts!
+                (<= stacks-block-height (get override-expiry override-request))
+                ERR-OVERRIDE-EXPIRED
+            )
+            (map-set emergency-overrides { override-id: override-id }
+                (merge override-request {
+                    supervisor-approval: true,
+                    supervising-responder: supervising-responder,
+                    override-status: "APPROVED",
+                    approval-timestamp: (some stacks-block-height),
+                })
+            )
+            (let ((audit-details u"Emergency override approved by supervisor"))
+                (log-audit-event (get prescription-id override-request) "EMERGENCY_OVERRIDE_APPROVED" audit-details)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (dispense-emergency-override
+        (override-id uint)
+        (dispensing-pharmacy principal)
+    )
+    (let (
+            (override-request (unwrap!
+                (map-get? emergency-overrides { override-id: override-id })
+                ERR-INVALID-EMERGENCY-OVERRIDE
+            ))
+        )
+        (begin
+            (asserts! (is-authorized-pharmacy dispensing-pharmacy) ERR-INVALID-PHARMACY)
+            (asserts!
+                (is-eq (get override-status override-request) "APPROVED")
+                ERR-INVALID-EMERGENCY-OVERRIDE
+            )
+            (asserts!
+                (<= stacks-block-height (get override-expiry override-request))
+                ERR-OVERRIDE-EXPIRED
+            )
+            (map-set emergency-overrides { override-id: override-id }
+                (merge override-request {
+                    override-status: "DISPENSED",
+                    dispensing-pharmacy: (some dispensing-pharmacy),
+                })
+            )
+            (let ((audit-details u"Emergency override dispensed to patient"))
+                (log-audit-event (get prescription-id override-request) "EMERGENCY_OVERRIDE_DISPENSED" audit-details)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (reject-emergency-override
+        (override-id uint)
+        (rejection-reason (string-utf8 128))
+    )
+    (let (
+            (override-request (unwrap!
+                (map-get? emergency-overrides { override-id: override-id })
+                ERR-INVALID-EMERGENCY-OVERRIDE
+            ))
+        )
+        (begin
+            (asserts!
+                (or
+                    (is-eq tx-sender (var-get contract-owner))
+                    (is-emergency-responder tx-sender)
+                )
+                ERR-NOT-EMERGENCY-RESPONDER
+            )
+            (asserts!
+                (is-eq (get override-status override-request) "PENDING")
+                ERR-OVERRIDE-ALREADY-EXISTS
+            )
+            (map-set emergency-overrides { override-id: override-id }
+                (merge override-request { override-status: "REJECTED" })
+            )
+            (let ((audit-details (concat u"Emergency override rejected: " rejection-reason)))
+                (log-audit-event (get prescription-id override-request) "EMERGENCY_OVERRIDE_REJECTED" audit-details)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-emergency-override (override-id uint))
+    (map-get? emergency-overrides { override-id: override-id })
+)
+
+(define-read-only (get-emergency-responder-info (responder principal))
+    (map-get? authorized-emergency-responders responder)
+)
+
+(define-read-only (get-emergency-override-counter)
+    (var-get emergency-override-counter)
+)
+
+(define-read-only (verify-emergency-access
+        (prescription-id uint)
+        (emergency-responder principal)
+    )
+    (let (
+            (prescription (unwrap!
+                (map-get? prescriptions { prescription-id: prescription-id })
+                ERR-INVALID-PRESCRIPTION
+            ))
+        )
+        (if (is-emergency-responder emergency-responder)
+            (ok {
+                prescription-valid: true,
+                responder-authorized: true,
+                can-request-override: true,
+                prescription-status: (if (get filled prescription) "FILLED" "AVAILABLE"),
+            })
+            (ok {
+                prescription-valid: true,
+                responder-authorized: false,
+                can-request-override: false,
+                prescription-status: (if (get filled prescription) "FILLED" "AVAILABLE"),
+            })
+        )
+    )
 )
 
